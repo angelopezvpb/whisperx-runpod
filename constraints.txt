@@ -1,8 +1,14 @@
-# Mantener el stack CUDA 11.8 / Torch 2.1 (evita PyTorch 2.6+ y el error weights_only)
-torch==2.1.0+cu118
-torchaudio==2.1.0+cu118
-torchvision==0.16.0+cu118
+# Torch stack estable CU118 (evita torch 2.6+ y movidas de safe-load)
+torch==2.1.2+cu118
+torchvision==0.16.2+cu118
+torchaudio==2.1.2+cu118
 
-# Cosas que suelen romper builds si se actualizan solas
-numpy<2
-protobuf<5
+# PyAV: debe ser wheel (no sdist)
+av==11.0.0
+
+# Stack whisperx/pyannote (ajusta si quieres, pero esto suele ir bien)
+whisperx==3.1.5
+pyannote.audio==3.1.1
+
+runpod==1.7.13
+requests==2.32.3
