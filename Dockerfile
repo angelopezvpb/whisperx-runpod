@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg git pkg-config build-essential python3-dev \
     libffi-dev libssl-dev \
     libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev \
-    libswscale-dev libswresample-dev \
+    libswscale-dev libswresample-dev libavresample-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir -U pip setuptools wheel
@@ -27,10 +27,13 @@ RUN pip install --no-cache-dir -c /app/constraints.txt \
     torch torchaudio torchvision
 
 # Install app deps but keep torch pinned
+# Pin av to a version compatible with ffmpeg 4.2 (Ubuntu 20.04)
 RUN pip install --no-cache-dir -c /app/constraints.txt \
     --extra-index-url https://download.pytorch.org/whl/cu118 \
     runpod==1.7.13 requests==2.32.3 \
-    whisperx pyannote.audio
+    "av==9.2.0" \
+    "whisperx==3.1.5" \
+    "pyannote.audio==3.1.1"
 
 # ---- Precache models (NO heredoc; use a script) ----
 COPY precache.py /app/precache.py
@@ -47,5 +50,6 @@ print('cuda available:', torch.cuda.is_available())"
 COPY handler.py /app/handler.py
 
 CMD ["python", "-u", "/app/handler.py"]
+
 
 
