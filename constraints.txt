@@ -1,3 +1,11 @@
+# Torch stack pinned to CUDA 11.8 (cu118)
 torch==2.1.0+cu118
 torchaudio==2.1.0+cu118
 torchvision==0.16.0+cu118
+
+# Avoid surprise upgrades that drag torch>=2.6
+pytorch-lightning<2.6
+lightning<2.6
+
+# Optional: keep numpy reasonable (pyannote/whisperx suelen ir finos así)
+numpy<2
