@@ -1,54 +1,37 @@
-# syntax=docker/dockerfile:1.5
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.1.0-devel
+# 1. USAR IMAGEN BASE MODERNA (CUDA 12.1+ es necesario para Torch 2.8)
+# Usamos una imagen de RunPod estable con Python 3.10 y CUDA 12
+FROM runpod/pytorch:2.2.1-py3.10-cuda12.1.1-devel-ubuntu22.04
 
-WORKDIR /app
-
-# --- Caches HF dentro de la imagen (para precache opcional) ---
-ENV HF_HOME=/models/hf
-ENV TRANSFORMERS_CACHE=/models/hf/transformers
-ENV HUGGINGFACE_HUB_CACHE=/models/hf/hub
-ENV TORCH_HOME=/models/torch
-
-RUN mkdir -p /models/hf /models/torch
-
-# --- System deps mínimos (NO build toolchain) ---
-RUN --mount=type=cache,target=/var/cache/apt \
-    apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg git \
+# 2. INSTALAR DEPENDENCIAS DE SISTEMA (FFmpeg y Git son obligatorios para WhisperX)
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --no-cache-dir -U pip setuptools wheel
+# 3. PREPARAR EL ENTORNO
+WORKDIR /app
 
-# Importante: copia constraints antes para que cachee bien
-COPY constraints.txt /app/constraints.txt
+# Actualizamos pip para asegurar compatibilidad con las ruedas modernas
+RUN python -m pip install --upgrade pip
 
-# 1) Fuerza PyAV por WHEEL (cero compilación)
-#    (si no existe wheel compatible, fallará aquí rápido y no después de 10 minutos)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir --only-binary=:all: -c /app/constraints.txt \
-      "av==15.1.0"
+# 4. LIMPIEZA CRÍTICA: Desinstalar el Torch base
+# Esto evita el conflicto "The conflict is caused by... torch". 
+# Borramos lo que trae la imagen para instalar TU lista limpia.
+RUN pip uninstall -y torch torchvision torchaudio
 
-# 2) Instala stack app (pinned) sin que torch se actualice
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -c /app/constraints.txt \
-      "runpod==1.7.13" \
-      "requests==2.32.5" \
-      "whisperx==3.7.2" \
-      "pyannote.audio==3.4.0"
+# 5. COPIAR E INSTALAR TU LISTA MAESTRA
+COPY requirements.txt /app/requirements.txt
 
-# (Opcional) Precache de modelos: descomentarlo cuando ya no estés iterando cada 2 min
-# COPY precache.py /app/precache.py
-# RUN --mount=type=cache,target=/root/.cache/pip \
-#     python /app/precache.py
+# Instalamos usando tu lista. El flag --no-cache-dir reduce el peso.
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Sanity check rápido
-RUN python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available())"
-
-# Copia handler al final para NO invalidar capas pesadas al tocar código
-COPY handler.py /app/handler.py
-
-CMD ["python", "-u", "/app/handler.py"]
+# 6. INSTALAR EL HANDLER DE RUNPOD
+# Asumiendo que tienes un script python para arrancar
+ADD src . 
+# Ajusta el nombre de tu archivo si no es handler.py
+CMD [ "python", "-u", "/handler.py" ]
 
 
 
