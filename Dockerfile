@@ -2,56 +2,51 @@ FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel
 
 WORKDIR /app
 
-# Cache locations inside the image (set early)
+# Cache de HF dentro de la imagen (para que el precache se quede en layers)
 ENV HF_HOME=/models/hf
 ENV TRANSFORMERS_CACHE=/models/hf/transformers
 ENV HUGGINGFACE_HUB_CACHE=/models/hf/hub
 ENV TORCH_HOME=/models/torch
-ENV HF_HUB_DISABLE_TELEMETRY=1
+
 RUN mkdir -p /models/hf /models/torch
 
-# ✅ Solo runtime deps (NO dev headers, NO build-essential)
+# --- System deps (solo lo necesario para compilar av==10.0.0 contra ffmpeg 4.2) ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg git \
+    ffmpeg pkg-config build-essential python3-dev \
+    libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev \
+    libswscale-dev libswresample-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir -U pip setuptools wheel
 
+# --- Constraints para impedir que whisperx/pyannote te actualicen torch a 2.6/2.8 ---
 COPY constraints.txt /app/constraints.txt
 
-# ✅ Fuerza torch CU118 EXACTO (evita upgrades raros)
-RUN pip install --no-cache-dir \
-  --index-url https://download.pytorch.org/whl/cu118 \
-  -c /app/constraints.txt \
-  torch torchvision torchaudio
-
-# ✅ CRÍTICO: fuerza PyAV wheel (si no hay wheel, falla aquí y no compila)
-RUN pip install --no-cache-dir \
-  --only-binary=:all: \
-  -c /app/constraints.txt \
-  av==11.0.0
-
-# ✅ App deps (con constraints para que NO toque torch/av)
-RUN pip install --no-cache-dir \
+# Asegura que torch stack cu118 se quede como toca (si ya está, esto es rápido)
+RUN pip install --no-cache-dir -c /app/constraints.txt \
   --extra-index-url https://download.pytorch.org/whl/cu118 \
-  -c /app/constraints.txt \
-  runpod requests whisperx pyannote.audio
+  torch torchaudio torchvision
 
-# ---- Precache models ----
+# 1) Instala PyAV compatible con FFmpeg 4.2 (evita el AV_CODEC_CAP_OTHER_THREADS)
+RUN pip install --no-cache-dir "av==10.0.0"
+
+# 2) Instala deps de app (con constraints para que NO toque torch)
+RUN pip install --no-cache-dir -c /app/constraints.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu118 \
+  runpod==1.7.13 requests==2.32.5 \
+  whisperx==3.7.2 pyannote.audio==3.4.0
+
+# --- Precache (sin heredoc) ---
 COPY precache.py /app/precache.py
 RUN python /app/precache.py
 
 # Sanity check
-RUN python -c "import torch, torchaudio, torchvision; \
-print('torch:', torch.__version__); \
-print('torchaudio:', torchaudio.__version__); \
-print('torchvision:', torchvision.__version__); \
-print('cuda available:', torch.cuda.is_available()); \
-print('device count:', torch.cuda.device_count())"
+RUN python -c "import torch; print('torch:', torch.__version__); print('cuda:', torch.cuda.is_available())"
 
-# Copy handler last (para que cambiar handler NO invalide capas pesadas)
+# Copia handler al final para no invalidar layers pesados en cambios de código
 COPY handler.py /app/handler.py
 
 CMD ["python", "-u", "/app/handler.py"]
+
 
 
