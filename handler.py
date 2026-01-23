@@ -14,12 +14,13 @@ original_load = torch.load
 
 def safe_load(*args, **kwargs):
     # Forzamos weights_only=False si no se especifica, para permitir cargar
-    # la configuración de pyannote/whisperx
+    # la configuración de pyannote/whisperx sin errores de seguridad
     if 'weights_only' not in kwargs:
         kwargs['weights_only'] = False
     return original_load(*args, **kwargs)
 
 torch.load = safe_load
+print("[INFO] Parche de seguridad torch.load aplicado correctamente.")
 # -------------------------------------------------------------------------
 
 
@@ -50,7 +51,8 @@ def _download_to_tmp(url: str) -> str:
     """
     Download remote audio to local /tmp to avoid ffmpeg TLS/proxy issues.
     """
-    local_path = f"/tmp/audio_{uuid.uuid4().hex}.mp3"
+    # Usamos una extensión genérica, ffmpeg detectará el formato real
+    local_path = f"/tmp/audio_{uuid.uuid4().hex}"
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(local_path, "wb") as f:
@@ -143,7 +145,10 @@ def handler(event):
             local_audio_path = _download_to_tmp(audio_file)
 
         # 2) Load audio (local)
-        audio = whisperx.load_audio(local_audio_path)
+        try:
+            audio = whisperx.load_audio(local_audio_path)
+        except Exception as e:
+            return {"error": f"Failed to load audio: {str(e)}"}
 
         # 3) Transcribe (cached model)
         model = _get_whisper_model(device, compute_type, language)
@@ -172,7 +177,7 @@ def handler(event):
                     )
                 except Exception as e:
                     print(f"[align] error: {e}")
-                    # No fallamos todo el trabajo si falla alinear, devolvemos transcripción
+                    # No fallamos todo el trabajo si falla alinear, continuamos
                     pass
 
         # 5) Diarization (optional)
@@ -181,13 +186,17 @@ def handler(event):
             if not hf_token:
                 return {"error": "huggingface_access_token required for diarization"}
 
-            diarizer = _get_diarizer(hf_token, device)
-            diarize_segments = diarizer(
-                audio,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers
-            )
-            result = whisperx.assign_word_speakers(diarize_segments, result)
+            try:
+                diarizer = _get_diarizer(hf_token, device)
+                diarize_segments = diarizer(
+                    audio,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers
+                )
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+            except Exception as e:
+                print(f"[diarization] error: {e}")
+                return {"error": f"Diarization failed: {str(e)}"}
 
         # cleanup local temp file
         try:
