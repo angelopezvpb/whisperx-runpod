@@ -9,11 +9,8 @@ import torch
 # -------------------------------------------------------------------------
 # ✅ FIX PyTorch 2.6+ (weights_only=True por defecto) + OmegaConf allowlist
 # -------------------------------------------------------------------------
-# 1) Fuerza global (si torch.load no recibe weights_only explícito)
-#    PyTorch documenta TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 para forzar weights_only=False
-os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")  # :contentReference[oaicite:2]{index=2}
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
-# 2) Allowlist de clases OmegaConf que aparecen en checkpoints de pyannote
 def _allowlist_omegaconf_for_torch():
     try:
         if not hasattr(torch, "serialization") or not hasattr(torch.serialization, "add_safe_globals"):
@@ -22,7 +19,6 @@ def _allowlist_omegaconf_for_torch():
 
         from omegaconf import DictConfig, ListConfig
         try:
-            # PyTorch 2.6 error típico menciona ContainerMetadata
             from omegaconf.base import ContainerMetadata
             allow = [DictConfig, ListConfig, ContainerMetadata]
         except Exception:
@@ -37,11 +33,9 @@ def _allowlist_omegaconf_for_torch():
 
 _allowlist_omegaconf_for_torch()
 
-# 3) Parche defensivo: wrapper de torch.load para asegurar weights_only=False si no viene
 _original_torch_load = torch.load
 
 def _safe_torch_load(*args, **kwargs):
-    # Solo toca si NO viene especificado
     kwargs.setdefault("weights_only", False)
     return _original_torch_load(*args, **kwargs)
 
@@ -54,14 +48,11 @@ print("[INFO] ✅ Parche global torch.load(weights_only=False) aplicado.")
 # ✅ FIX WhisperX moderno: DiarizationPipeline se importa desde whisperx.diarize
 # -------------------------------------------------------------------------
 def _get_diarization_pipeline_class():
-    # WhisperX moderno (documentado)
     try:
         from whisperx.diarize import DiarizationPipeline
         return DiarizationPipeline
     except Exception:
-        # Fallback por si tienes una versión vieja donde existía en el root
         return getattr(whisperx, "DiarizationPipeline", None)
-
 
 DiarizationPipelineCls = _get_diarization_pipeline_class()
 # -------------------------------------------------------------------------
@@ -114,7 +105,7 @@ def _get_device_and_compute(input_data: dict):
     return device, compute_type
 
 
-def _get_whisper_model(device: str, compute_type: str, language: str | None):
+def _get_whisper_model(device: str, compute_type: str):
     global WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
 
     if WHISPER_MODEL is None or WHISPER_DEVICE != device or WHISPER_COMPUTE_TYPE != compute_type:
@@ -154,6 +145,38 @@ def _get_diarizer(hf_token: str, device: str):
     return DIARIZE_CACHE[key]
 
 
+def build_clips_from_segments(segments, gap=0.35, pad_start=0.10, pad_end=0.20):
+    """
+    Construye clips estables a partir de los timestamps de segmentos (Whisper).
+    - gap: si la pausa entre segmentos supera esto (s), se corta clip.
+    - pad_start / pad_end: margen para no cortar consonantes/respiraciones.
+    """
+    clips = []
+    if not segments:
+        return clips
+
+    cur_start = float(segments[0]["start"])
+    cur_end = float(segments[0]["end"])
+
+    for s in segments[1:]:
+        s_start = float(s["start"])
+        s_end = float(s["end"])
+        if (s_start - cur_end) <= gap:
+            cur_end = max(cur_end, s_end)
+        else:
+            clips.append({
+                "start": max(0.0, cur_start - pad_start),
+                "end": max(0.0, cur_end + pad_end),
+            })
+            cur_start, cur_end = s_start, s_end
+
+    clips.append({
+        "start": max(0.0, cur_start - pad_start),
+        "end": max(0.0, cur_end + pad_end),
+    })
+    return clips
+
+
 def handler(event):
     global _LOGGED
     if not _LOGGED:
@@ -167,11 +190,13 @@ def handler(event):
         if not audio_file:
             return {"error": "audio_file is required"}
 
-        language = input_data.get("language")
+        language = input_data.get("language")  # e.g. "es"
         batch_size = int(input_data.get("batch_size", 16))
 
-        align_output = bool(input_data.get("align_output", True))
+        # IMPORTANTE: Para recorte fiable, por defecto alineado OFF.
+        align_output = bool(input_data.get("align_output", False))
         diarization = bool(input_data.get("diarization", False))
+
         min_speakers = input_data.get("min_speakers")
         max_speakers = input_data.get("max_speakers")
 
@@ -187,23 +212,32 @@ def handler(event):
         except Exception as e:
             return {"error": f"Failed to load audio: {str(e)}"}
 
-        model = _get_whisper_model(device, compute_type, language)
+        model = _get_whisper_model(device, compute_type)
 
-        transcribe_kwargs = {"batch_size": batch_size}
+        # ✅ VAD + no contexto acumulado => timestamps más estables
+        transcribe_kwargs = {
+            "batch_size": batch_size,
+            "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 300},
+            "condition_on_previous_text": False,
+        }
         if language:
             transcribe_kwargs["language"] = language
 
         result = model.transcribe(audio, **transcribe_kwargs)
 
-        # ALIGN
+        # ALIGN (opcional)
         if align_output:
             lang_code = result.get("language") or language
             if not lang_code:
                 print("[align] skipped (no language detected)")
             else:
                 try:
+                    det_lang = result.get("language")
+                    det_lang_prob = result.get("language_probability")
+
                     align_model, metadata = _get_align(lang_code, device)
-                    result = whisperx.align(
+                    aligned = whisperx.align(
                         result["segments"],
                         align_model,
                         metadata,
@@ -211,10 +245,19 @@ def handler(event):
                         device,
                         return_char_alignments=False
                     )
+
+                    # ✅ NO pisar 'result', solo actualizar lo necesario
+                    result["segments"] = aligned.get("segments", result["segments"])
+                    if "word_segments" in aligned:
+                        result["word_segments"] = aligned["word_segments"]
+
+                    result["language"] = det_lang
+                    result["language_probability"] = det_lang_prob
+
                 except Exception as e:
                     print(f"[align] error: {e}")
 
-        # DIARIZATION
+        # DIARIZATION (opcional)
         if diarization:
             hf_token = input_data.get("huggingface_access_token")
             if not hf_token:
@@ -223,7 +266,6 @@ def handler(event):
             try:
                 diarizer = _get_diarizer(hf_token, device)
 
-                # WhisperX doc: diarize_model(audio) y opcionalmente min/max speakers :contentReference[oaicite:3]{index=3}
                 diarize_kwargs = {}
                 if min_speakers is not None:
                     diarize_kwargs["min_speakers"] = min_speakers
@@ -240,6 +282,15 @@ def handler(event):
                     return {"error": f"Security Error: PyTorch blocked model load. Details: {msg}"}
                 return {"error": f"Diarization failed: {msg}"}
 
+        # ✅ Clips listos para recortar por ffmpeg (basados en segmentos)
+        segments = result.get("segments", [])
+        clips = build_clips_from_segments(
+            segments,
+            gap=float(input_data.get("clip_gap", 0.35)),
+            pad_start=float(input_data.get("clip_pad_start", 0.10)),
+            pad_end=float(input_data.get("clip_pad_end", 0.20)),
+        )
+
         # Cleanup temp
         try:
             if isinstance(local_audio_path, str) and local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
@@ -252,7 +303,8 @@ def handler(event):
             torch.cuda.empty_cache()
 
         return {
-            "segments": result.get("segments", []),
+            "segments": segments,
+            "clips": clips,  # ✅ usa esto para recortar fiable
             "detected_language": result.get("language"),
             "language_probability": result.get("language_probability"),
         }
@@ -262,6 +314,7 @@ def handler(event):
 
 
 runpod.serverless.start({"handler": handler})
+
 
 
  
