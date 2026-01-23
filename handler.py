@@ -264,5 +264,4 @@ def handler(event):
 runpod.serverless.start({"handler": handler})
 
 
-
-runpod.serverless.start({"handler": handler})
+ 
