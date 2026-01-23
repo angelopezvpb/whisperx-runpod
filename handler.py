@@ -3,35 +3,67 @@ import uuid
 import gc
 import requests
 import runpod
-import whisperx
 import torch
 
 # -------------------------------------------------------------------------
-# ⚠️ PARCHE DE SEGURIDAD V2 (EL "NUCLEAR")
-# PyTorch 2.6+ bloquea archivos de configuración de Pyannote.
-# Aquí aplicamos AMBAS soluciones: Whitelist oficial y desactivación forzosa.
+# ✅ PARCHE PyTorch 2.6+ para diarización (pyannote/whisperx)
+# - PyTorch 2.6 cambia torch.load default a weights_only=True
+# - Checkpoints de pyannote incluyen objetos OmegaConf (ContainerMetadata, etc.)
+# - Solución robusta: allowlist + forzar weights_only=False
 # -------------------------------------------------------------------------
-try:
-    # 1. SOLUCIÓN OFICIAL: Autorizar OmegaConf (usado por pyannote)
-    # Esto soluciona el error "Unsupported global: GLOBAL omegaconf..."
-    from omegaconf import DictConfig, ListConfig
-    torch.serialization.add_safe_globals([DictConfig, ListConfig])
-    print("[INFO] ✅ OmegaConf (ListConfig/DictConfig) añadido a la lista segura de PyTorch.")
-except ImportError:
-    print("[WARN] ⚠️ OmegaConf no encontrado. Si usas diarización, esto fallará.")
-except Exception as e:
-    print(f"[WARN] ⚠️ Error al añadir safe_globals: {e}")
 
-# 2. SOLUCIÓN DE FUERZA BRUTA: Sobrescribir torch.load
-# Por si alguna librería interna no usa el mecanismo estándar
-original_load = torch.load
-def safe_load(*args, **kwargs):
-    if 'weights_only' not in kwargs:
-        kwargs['weights_only'] = False
-    return original_load(*args, **kwargs)
-torch.load = safe_load
-print("[INFO] ✅ Parche global torch.load(weights_only=False) aplicado.")
-# -------------------------------------------------------------------------
+def _apply_torch26_omegaconf_patch():
+    # 1) Allowlist oficial (weights_only=True) -> evita "Unsupported global: omegaconf..."
+    try:
+        # Importa clases específicas que suelen aparecer en checkpoints Hydra/OmegaConf
+        from omegaconf.base import ContainerMetadata, Metadata
+        from omegaconf.dictconfig import DictConfig
+        from omegaconf.listconfig import ListConfig
+
+        safe = [ContainerMetadata, Metadata, DictConfig, ListConfig]
+
+        # Algunas versiones incluyen nodos extra; si existen, se añaden
+        try:
+            from omegaconf.nodes import AnyNode
+            safe.append(AnyNode)
+        except Exception:
+            pass
+
+        try:
+            from omegaconf._utils import _ensure_container  # a veces aparece en pickles antiguos
+            safe.append(_ensure_container)
+        except Exception:
+            pass
+
+        torch.serialization.add_safe_globals(safe)
+        print("[INFO] ✅ OmegaConf allowlist aplicada (ContainerMetadata/Metadata/DictConfig/ListConfig + extras).")
+    except ImportError:
+        print("[WARN] ⚠️ OmegaConf no encontrado. Si activas diarización, puede fallar.")
+    except Exception as e:
+        print(f"[WARN] ⚠️ Error aplicando allowlist OmegaConf: {e}")
+
+    # 2) Fuerza bruta: forzar weights_only=False SIEMPRE
+    # Esto evita que torch.load bloquee objetos no allowlisted (pero implica riesgo si NO confías en el checkpoint).
+    _orig_torch_load = torch.load
+
+    def _forced_full_load(*args, **kwargs):
+        # PISA cualquier valor (True/False) y fuerza False
+        kwargs["weights_only"] = False
+        return _orig_torch_load(*args, **kwargs)
+
+    torch.load = _forced_full_load
+
+    # Algunas libs llaman a torch.serialization.load directamente
+    if hasattr(torch.serialization, "load"):
+        torch.serialization.load = _forced_full_load
+
+    print("[INFO] ✅ Parche global aplicado: torch.load/torch.serialization.load(weights_only=False).")
+
+
+_apply_torch26_omegaconf_patch()
+
+# Importa whisperx DESPUÉS del parche (clave)
+import whisperx
 
 
 # ----------------------------
@@ -41,7 +73,7 @@ WHISPER_MODEL = None
 WHISPER_DEVICE = None
 WHISPER_COMPUTE_TYPE = None
 
-ALIGN_CACHE = {}        # key: language_code -> (align_model, metadata)
+ALIGN_CACHE = {}        # key: (language_code, device) -> (align_model, metadata)
 DIARIZE_CACHE = {}      # key: (hf_token, device) -> diarize_pipeline
 
 
@@ -91,7 +123,7 @@ def _get_whisper_model(device: str, compute_type: str, language: str | None):
             "large-v3",
             device,
             compute_type=compute_type,
-            language=None 
+            language=None
         )
         WHISPER_DEVICE = device
         WHISPER_COMPUTE_TYPE = compute_type
@@ -174,6 +206,7 @@ def handler(event):
                     )
                 except Exception as e:
                     print(f"[align] error: {e}")
+                    # No rompemos el job si falla align
                     pass
 
         if diarization:
@@ -191,12 +224,14 @@ def handler(event):
                 result = whisperx.assign_word_speakers(diarize_segments, result)
             except Exception as e:
                 print(f"[diarization] error: {e}")
-                if "weights_only" in str(e):
-                     return {"error": f"Security Error: PyTorch blocked the model load. Details: {str(e)}"}
+                # Mensaje más claro
+                if "Weights only load failed" in str(e) or "weights_only" in str(e) or "Unsupported global" in str(e):
+                    return {"error": f"PyTorch 2.6+ blocked checkpoint load (OmegaConf). Patch should fix this. Details: {str(e)}"}
                 return {"error": f"Diarization failed: {str(e)}"}
 
+        # Limpieza temporal
         try:
-            if local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
+            if isinstance(local_audio_path, str) and local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
                 os.remove(local_audio_path)
         except Exception:
             pass
