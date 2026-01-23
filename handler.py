@@ -6,6 +6,23 @@ import runpod
 import whisperx
 import torch
 
+# -------------------------------------------------------------------------
+# ⚠️ PARCHE DE SEGURIDAD CRÍTICO PARA PYTORCH 2.4+
+# Sin esto, la diarización fallará con error "Unsupported global: omegaconf"
+# -------------------------------------------------------------------------
+original_load = torch.load
+
+def safe_load(*args, **kwargs):
+    # Forzamos weights_only=False si no se especifica, para permitir cargar
+    # la configuración de pyannote/whisperx
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return original_load(*args, **kwargs)
+
+torch.load = safe_load
+# -------------------------------------------------------------------------
+
+
 # ----------------------------
 # Global caches (reuse worker)
 # ----------------------------
@@ -13,8 +30,8 @@ WHISPER_MODEL = None
 WHISPER_DEVICE = None
 WHISPER_COMPUTE_TYPE = None
 
-ALIGN_CACHE = {}       # key: language_code -> (align_model, metadata)
-DIARIZE_CACHE = {}     # key: (hf_token, device) -> diarize_pipeline
+ALIGN_CACHE = {}        # key: language_code -> (align_model, metadata)
+DIARIZE_CACHE = {}      # key: (hf_token, device) -> diarize_pipeline
 
 
 def _log_gpu_once():
@@ -60,9 +77,7 @@ def _get_device_and_compute(input_data: dict):
 
 def _get_whisper_model(device: str, compute_type: str, language: str | None):
     """
-    Cache whisper model across requests (worker reuse).
-    NOTE: If you need multiple languages with forced language in load_model,
-    consider caching per-language. Here we keep it simple and let transcribe handle language.
+    Cache whisper model across requests (reuse worker).
     """
     global WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
 
@@ -73,7 +88,7 @@ def _get_whisper_model(device: str, compute_type: str, language: str | None):
             "large-v3",
             device,
             compute_type=compute_type,
-            language=None  # IMPORTANT: don't pin here; handle in transcribe
+            language=None 
         )
         WHISPER_DEVICE = device
         WHISPER_COMPUTE_TYPE = compute_type
@@ -99,12 +114,6 @@ def _get_diarizer(hf_token: str, device: str):
 
 
 def handler(event):
-    """
-    WhisperX handler with:
-    - local download to avoid ffmpeg TLS issues
-    - model caching
-    - optional align + diarization
-    """
     global _LOGGED
     if not _LOGGED:
         _log_gpu_once()
@@ -149,18 +158,22 @@ def handler(event):
         if align_output:
             lang_code = result.get("language") or language
             if not lang_code:
-                # fallback: no align if we can't determine language
                 print("[align] skipped (no language detected)")
             else:
-                align_model, metadata = _get_align(lang_code, device)
-                result = whisperx.align(
-                    result["segments"],
-                    align_model,
-                    metadata,
-                    audio,
-                    device,
-                    return_char_alignments=False
-                )
+                try:
+                    align_model, metadata = _get_align(lang_code, device)
+                    result = whisperx.align(
+                        result["segments"],
+                        align_model,
+                        metadata,
+                        audio,
+                        device,
+                        return_char_alignments=False
+                    )
+                except Exception as e:
+                    print(f"[align] error: {e}")
+                    # No fallamos todo el trabajo si falla alinear, devolvemos transcripción
+                    pass
 
         # 5) Diarization (optional)
         if diarization:
@@ -183,7 +196,7 @@ def handler(event):
         except Exception:
             pass
 
-        # light cleanup (don’t delete cached models)
+        # light cleanup
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
