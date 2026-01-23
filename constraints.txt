@@ -1,10 +1,2 @@
-# Mantén el stack CUDA 11.8 / torch 2.1.x (el de la base image)
-torch==2.1.0+cu118
-torchaudio==2.1.0+cu118
-torchvision==0.16.0+cu118
-
-# Fuerza PyAV a wheel moderna (evita build-from-source)
-av==15.1.0
-
-# Opcional: por si algún paquete intenta “inventarse” builds raros
-numpy<2.1
+runpod==1.7.13
+requests==2.32.5
