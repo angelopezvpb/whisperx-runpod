@@ -1,28 +1,31 @@
+import torch
+
+# -------------------------------------------------------------------------
+# ⚠️ PARCHE DE SEGURIDAD (Mover al principio del archivo)
+# Esto DEBE ejecutarse antes de importar whisperx o pyannote
+# para evitar el error "Weights only load failed" con omegaconf.
+# -------------------------------------------------------------------------
+try:
+    original_load = torch.load
+    def safe_load(*args, **kwargs):
+        # Forzamos weights_only=False para permitir cargar configuraciones complejas
+        if 'weights_only' not in kwargs:
+            kwargs['weights_only'] = False
+        return original_load(*args, **kwargs)
+    torch.load = safe_load
+    print("[INFO] Parche de seguridad torch.load aplicado correctamente.")
+except Exception as e:
+    print(f"[WARN] No se pudo aplicar el parche de seguridad: {e}")
+
+# -------------------------------------------------------------------------
+# AHORA importamos el resto de librerías
+# -------------------------------------------------------------------------
 import os
 import uuid
 import gc
 import requests
 import runpod
 import whisperx
-import torch
-
-# -------------------------------------------------------------------------
-# ⚠️ PARCHE DE SEGURIDAD CRÍTICO PARA PYTORCH 2.4+
-# Sin esto, la diarización fallará con error "Unsupported global: omegaconf"
-# -------------------------------------------------------------------------
-original_load = torch.load
-
-def safe_load(*args, **kwargs):
-    # Forzamos weights_only=False si no se especifica, para permitir cargar
-    # la configuración de pyannote/whisperx sin errores de seguridad
-    if 'weights_only' not in kwargs:
-        kwargs['weights_only'] = False
-    return original_load(*args, **kwargs)
-
-torch.load = safe_load
-print("[INFO] Parche de seguridad torch.load aplicado correctamente.")
-# -------------------------------------------------------------------------
-
 
 # ----------------------------
 # Global caches (reuse worker)
@@ -51,7 +54,6 @@ def _download_to_tmp(url: str) -> str:
     """
     Download remote audio to local /tmp to avoid ffmpeg TLS/proxy issues.
     """
-    # Usamos una extensión genérica, ffmpeg detectará el formato real
     local_path = f"/tmp/audio_{uuid.uuid4().hex}"
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -78,9 +80,6 @@ def _get_device_and_compute(input_data: dict):
 
 
 def _get_whisper_model(device: str, compute_type: str, language: str | None):
-    """
-    Cache whisper model across requests (reuse worker).
-    """
     global WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
 
     # If model not loaded or device/compute changed, reload
@@ -177,7 +176,6 @@ def handler(event):
                     )
                 except Exception as e:
                     print(f"[align] error: {e}")
-                    # No fallamos todo el trabajo si falla alinear, continuamos
                     pass
 
         # 5) Diarization (optional)
@@ -196,6 +194,9 @@ def handler(event):
                 result = whisperx.assign_word_speakers(diarize_segments, result)
             except Exception as e:
                 print(f"[diarization] error: {e}")
+                # Importante: Si falla la diarización por el error de pesos, lo veremos aquí
+                if "weights_only" in str(e):
+                     return {"error": "Diarization failed due to PyTorch security setting. Patch failed."}
                 return {"error": f"Diarization failed: {str(e)}"}
 
         # cleanup local temp file
