@@ -1,34 +1,41 @@
-import torch
-
-# -------------------------------------------------------------------------
-# ⚠️ PARCHE DE SEGURIDAD (Mover al principio del archivo)
-# Esto DEBE ejecutarse antes de importar whisperx o pyannote
-# para evitar el error "Weights only load failed" con omegaconf.
-# -------------------------------------------------------------------------
-try:
-    original_load = torch.load
-    def safe_load(*args, **kwargs):
-        # Forzamos weights_only=False para permitir cargar configuraciones complejas
-        if 'weights_only' not in kwargs:
-            kwargs['weights_only'] = False
-        return original_load(*args, **kwargs)
-    torch.load = safe_load
-    print("[INFO] Parche de seguridad torch.load aplicado correctamente.")
-except Exception as e:
-    print(f"[WARN] No se pudo aplicar el parche de seguridad: {e}")
-
-# -------------------------------------------------------------------------
-# AHORA importamos el resto de librerías
-# -------------------------------------------------------------------------
 import os
 import uuid
 import gc
 import requests
 import runpod
 import whisperx
+import torch
+
+# -------------------------------------------------------------------------
+# ⚠️ PARCHE DE SEGURIDAD V2 (EL "NUCLEAR")
+# PyTorch 2.6+ bloquea archivos de configuración de Pyannote.
+# Aquí aplicamos AMBAS soluciones: Whitelist oficial y desactivación forzosa.
+# -------------------------------------------------------------------------
+try:
+    # 1. SOLUCIÓN OFICIAL: Autorizar OmegaConf (usado por pyannote)
+    # Esto soluciona el error "Unsupported global: GLOBAL omegaconf..."
+    from omegaconf import DictConfig, ListConfig
+    torch.serialization.add_safe_globals([DictConfig, ListConfig])
+    print("[INFO] ✅ OmegaConf (ListConfig/DictConfig) añadido a la lista segura de PyTorch.")
+except ImportError:
+    print("[WARN] ⚠️ OmegaConf no encontrado. Si usas diarización, esto fallará.")
+except Exception as e:
+    print(f"[WARN] ⚠️ Error al añadir safe_globals: {e}")
+
+# 2. SOLUCIÓN DE FUERZA BRUTA: Sobrescribir torch.load
+# Por si alguna librería interna no usa el mecanismo estándar
+original_load = torch.load
+def safe_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return original_load(*args, **kwargs)
+torch.load = safe_load
+print("[INFO] ✅ Parche global torch.load(weights_only=False) aplicado.")
+# -------------------------------------------------------------------------
+
 
 # ----------------------------
-# Global caches (reuse worker)
+# Global caches
 # ----------------------------
 WHISPER_MODEL = None
 WHISPER_DEVICE = None
@@ -51,9 +58,6 @@ _LOGGED = False
 
 
 def _download_to_tmp(url: str) -> str:
-    """
-    Download remote audio to local /tmp to avoid ffmpeg TLS/proxy issues.
-    """
     local_path = f"/tmp/audio_{uuid.uuid4().hex}"
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -65,7 +69,6 @@ def _download_to_tmp(url: str) -> str:
 
 
 def _get_device_and_compute(input_data: dict):
-    # allow overrides
     forced_device = input_data.get("device")
     if forced_device in ("cuda", "cpu"):
         device = forced_device
@@ -82,7 +85,6 @@ def _get_device_and_compute(input_data: dict):
 def _get_whisper_model(device: str, compute_type: str, language: str | None):
     global WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
 
-    # If model not loaded or device/compute changed, reload
     if WHISPER_MODEL is None or WHISPER_DEVICE != device or WHISPER_COMPUTE_TYPE != compute_type:
         print(f"[model] loading whisper large-v3 device={device} compute_type={compute_type}")
         WHISPER_MODEL = whisperx.load_model(
@@ -127,7 +129,7 @@ def handler(event):
         if not audio_file:
             return {"error": "audio_file is required"}
 
-        language = input_data.get("language")  # can be None -> autodetect
+        language = input_data.get("language")
         batch_size = int(input_data.get("batch_size", 16))
 
         align_output = bool(input_data.get("align_output", True))
@@ -138,18 +140,15 @@ def handler(event):
         device, compute_type = _get_device_and_compute(input_data)
         print(f"[job] device={device} compute_type={compute_type} batch_size={batch_size} diarization={diarization} align={align_output}")
 
-        # 1) Get local audio path
         local_audio_path = audio_file
         if isinstance(audio_file, str) and audio_file.startswith(("http://", "https://")):
             local_audio_path = _download_to_tmp(audio_file)
 
-        # 2) Load audio (local)
         try:
             audio = whisperx.load_audio(local_audio_path)
         except Exception as e:
             return {"error": f"Failed to load audio: {str(e)}"}
 
-        # 3) Transcribe (cached model)
         model = _get_whisper_model(device, compute_type, language)
 
         transcribe_kwargs = {"batch_size": batch_size}
@@ -158,7 +157,6 @@ def handler(event):
 
         result = model.transcribe(audio, **transcribe_kwargs)
 
-        # 4) Align (optional)
         if align_output:
             lang_code = result.get("language") or language
             if not lang_code:
@@ -178,7 +176,6 @@ def handler(event):
                     print(f"[align] error: {e}")
                     pass
 
-        # 5) Diarization (optional)
         if diarization:
             hf_token = input_data.get("huggingface_access_token")
             if not hf_token:
@@ -194,19 +191,16 @@ def handler(event):
                 result = whisperx.assign_word_speakers(diarize_segments, result)
             except Exception as e:
                 print(f"[diarization] error: {e}")
-                # Importante: Si falla la diarización por el error de pesos, lo veremos aquí
                 if "weights_only" in str(e):
-                     return {"error": "Diarization failed due to PyTorch security setting. Patch failed."}
+                     return {"error": f"Security Error: PyTorch blocked the model load. Details: {str(e)}"}
                 return {"error": f"Diarization failed: {str(e)}"}
 
-        # cleanup local temp file
         try:
             if local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
                 os.remove(local_audio_path)
         except Exception:
             pass
 
-        # light cleanup
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
