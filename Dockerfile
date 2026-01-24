@@ -34,3 +34,4 @@ COPY handler.py /app/handler.py
 
 # 7. COMANDO DE ARRANQUE
 CMD [ "python", "-u", "/app/handler.py" ]
+
