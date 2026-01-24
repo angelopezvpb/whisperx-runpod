@@ -5,6 +5,7 @@ import requests
 import runpod
 import whisperx
 import torch
+import inspect
 
 # -------------------------------------------------------------------------
 # ✅ FIX PyTorch 2.6+ (weights_only=True por defecto) + OmegaConf allowlist
@@ -58,6 +59,29 @@ DiarizationPipelineCls = _get_diarization_pipeline_class()
 # -------------------------------------------------------------------------
 
 
+# -------------------------------------------------------------------------
+# ✅ Compat helpers (kwargs "a prueba de versiones")
+# -------------------------------------------------------------------------
+def _filter_kwargs_by_signature(fn, kwargs: dict) -> dict:
+    """Devuelve solo kwargs soportados por la firma de fn (evita unexpected keyword argument)."""
+    try:
+        sig = inspect.signature(fn)
+        allowed = set(sig.parameters.keys())
+        safe = {k: v for k, v in kwargs.items() if k in allowed}
+        dropped = sorted(set(kwargs.keys()) - set(safe.keys()))
+        if dropped:
+            print(f"[compat] kwargs ignorados para {getattr(fn, '__name__', str(fn))}: {dropped}")
+        return safe
+    except Exception:
+        # Si no podemos inspeccionar, no tocamos
+        return kwargs
+
+def _call_transcribe_safely(model, audio, **kwargs):
+    safe_kwargs = _filter_kwargs_by_signature(model.transcribe, kwargs)
+    return model.transcribe(audio, **safe_kwargs)
+# -------------------------------------------------------------------------
+
+
 # ----------------------------
 # Global caches
 # ----------------------------
@@ -105,16 +129,36 @@ def _get_device_and_compute(input_data: dict):
     return device, compute_type
 
 
-def _get_whisper_model(device: str, compute_type: str):
+def _get_whisper_model(device: str, compute_type: str, language: str | None):
+    """
+    Carga el modelo de WhisperX de forma compatible:
+    - Intenta inyectar VAD/anti-deriva mediante asr_options si load_model lo soporta.
+    - Si no, no rompe.
+    """
     global WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
 
     if WHISPER_MODEL is None or WHISPER_DEVICE != device or WHISPER_COMPUTE_TYPE != compute_type:
         print(f"[model] loading whisper large-v3 device={device} compute_type={compute_type}")
+
+        # Preferencias para timestamps más estables (si están soportadas por tu build)
+        asr_options = {
+            "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 300},
+            "condition_on_previous_text": False,
+        }
+
+        load_kwargs = {
+            "compute_type": compute_type,
+            "language": None,  # autodetect
+            "asr_options": asr_options,
+        }
+
+        safe_load_kwargs = _filter_kwargs_by_signature(whisperx.load_model, load_kwargs)
+
         WHISPER_MODEL = whisperx.load_model(
             "large-v3",
             device,
-            compute_type=compute_type,
-            language=None  # autodetect
+            **safe_load_kwargs
         )
         WHISPER_DEVICE = device
         WHISPER_COMPUTE_TYPE = compute_type
@@ -193,7 +237,7 @@ def handler(event):
         language = input_data.get("language")  # e.g. "es"
         batch_size = int(input_data.get("batch_size", 16))
 
-        # IMPORTANTE: Para recorte fiable, por defecto alineado OFF.
+        # Para recorte fiable, por defecto alineado OFF.
         align_output = bool(input_data.get("align_output", False))
         diarization = bool(input_data.get("diarization", False))
 
@@ -212,21 +256,20 @@ def handler(event):
         except Exception as e:
             return {"error": f"Failed to load audio: {str(e)}"}
 
-        model = _get_whisper_model(device, compute_type)
+        model = _get_whisper_model(device, compute_type, language)
 
-        # ✅ VAD + no contexto acumulado => timestamps más estables
+        # ✅ kwargs "ideales" (se filtrarán según versión)
         transcribe_kwargs = {
             "batch_size": batch_size,
-            "vad_filter": True,
-            "vad_parameters": {"min_silence_duration_ms": 300},
             "condition_on_previous_text": False,
         }
         if language:
             transcribe_kwargs["language"] = language
 
-        result = model.transcribe(audio, **transcribe_kwargs)
+        # ✅ llamada robusta (no rompe si no acepta ciertos kwargs)
+        result = _call_transcribe_safely(model, audio, **transcribe_kwargs)
 
-        # ALIGN (opcional)
+        # ALIGN (opcional) — IMPORTANTE: no pisar `result`
         if align_output:
             lang_code = result.get("language") or language
             if not lang_code:
@@ -314,6 +357,7 @@ def handler(event):
 
 
 runpod.serverless.start({"handler": handler})
+
 
 
 
