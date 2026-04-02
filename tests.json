@@ -13,6 +13,17 @@
         "batch_size": 16
       },
       "timeout": 10000
+    },
+    {
+      "name": "validation_multiple_audio_input",
+      "input": {
+        "audio_file": "https://example.com/audio1.mp3;https://example.com/audio2.mp3",
+        "language": "de",
+        "diarization": false,
+        "align_output": false,
+        "batch_size": 16
+      },
+      "timeout": 10000
     }
   ],
   "config": {

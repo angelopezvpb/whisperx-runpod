@@ -24,6 +24,18 @@ WhisperX Serverless Worker mit Speaker Diarization (pyannote.audio 3.1)
 }
 ```
 
+`audio_file` acepta uno o varios audios. Para varios, envialos en el mismo string separados por `;`:
+
+```json
+{
+  "input": {
+    "audio_file": "https://example.com/audio1.mp3;https://example.com/audio2.mp3"
+  }
+}
+```
+
+Si envias un solo audio, la respuesta mantiene el formato actual. Si envias varios, la respuesta sera un array con un resultado por cada audio, incluyendo su campo `audio_file` y errores por item si alguno falla.
+
 ## Setup
 
 1. Accept HuggingFace model access:

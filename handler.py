@@ -221,34 +221,28 @@ def build_clips_from_segments(segments, gap=0.35, pad_start=0.10, pad_end=0.20):
     return clips
 
 
-def handler(event):
-    global _LOGGED
-    if not _LOGGED:
-        _log_gpu_once()
-        _LOGGED = True
+def _parse_audio_files(audio_file_value):
+    if isinstance(audio_file_value, str):
+        return [item.strip() for item in audio_file_value.split(";") if item.strip()]
+    return []
+
+
+def _process_single_audio(
+    audio_file: str,
+    input_data: dict,
+    device: str,
+    compute_type: str,
+    language: str | None,
+    batch_size: int,
+    align_output: bool,
+    diarization: bool,
+    min_speakers,
+    max_speakers,
+):
+    local_audio_path = audio_file
 
     try:
-        input_data = event.get("input", {}) or {}
-
-        audio_file = input_data.get("audio_file")
-        if not audio_file:
-            return {"error": "audio_file is required"}
-
-        language = input_data.get("language")  # e.g. "es"
-        batch_size = int(input_data.get("batch_size", 16))
-
-        # Para recorte fiable, por defecto alineado OFF.
-        align_output = bool(input_data.get("align_output", False))
-        diarization = bool(input_data.get("diarization", False))
-
-        min_speakers = input_data.get("min_speakers")
-        max_speakers = input_data.get("max_speakers")
-
-        device, compute_type = _get_device_and_compute(input_data)
-        print(f"[job] device={device} compute_type={compute_type} batch_size={batch_size} diarization={diarization} align={align_output}")
-
-        local_audio_path = audio_file
-        if isinstance(audio_file, str) and audio_file.startswith(("http://", "https://")):
+        if audio_file.startswith(("http://", "https://")):
             local_audio_path = _download_to_tmp(audio_file)
 
         try:
@@ -258,7 +252,6 @@ def handler(event):
 
         model = _get_whisper_model(device, compute_type, language)
 
-        # ✅ kwargs "ideales" (se filtrarán según versión)
         transcribe_kwargs = {
             "batch_size": batch_size,
             "condition_on_previous_text": False,
@@ -266,10 +259,8 @@ def handler(event):
         if language:
             transcribe_kwargs["language"] = language
 
-        # ✅ llamada robusta (no rompe si no acepta ciertos kwargs)
         result = _call_transcribe_safely(model, audio, **transcribe_kwargs)
 
-        # ALIGN (opcional) — IMPORTANTE: no pisar `result`
         if align_output:
             lang_code = result.get("language") or language
             if not lang_code:
@@ -289,7 +280,6 @@ def handler(event):
                         return_char_alignments=False
                     )
 
-                    # ✅ NO pisar 'result', solo actualizar lo necesario
                     result["segments"] = aligned.get("segments", result["segments"])
                     if "word_segments" in aligned:
                         result["word_segments"] = aligned["word_segments"]
@@ -300,7 +290,6 @@ def handler(event):
                 except Exception as e:
                     print(f"[align] error: {e}")
 
-        # DIARIZATION (opcional)
         if diarization:
             hf_token = input_data.get("huggingface_access_token")
             if not hf_token:
@@ -325,7 +314,6 @@ def handler(event):
                     return {"error": f"Security Error: PyTorch blocked model load. Details: {msg}"}
                 return {"error": f"Diarization failed: {msg}"}
 
-        # ✅ Clips listos para recortar por ffmpeg (basados en segmentos)
         segments = result.get("segments", [])
         clips = build_clips_from_segments(
             segments,
@@ -334,9 +322,16 @@ def handler(event):
             pad_end=float(input_data.get("clip_pad_end", 0.20)),
         )
 
-        # Cleanup temp
+        return {
+            "segments": segments,
+            "clips": clips,
+            "detected_language": result.get("language"),
+            "language_probability": result.get("language_probability"),
+        }
+
+    finally:
         try:
-            if isinstance(local_audio_path, str) and local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
+            if local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
                 os.remove(local_audio_path)
         except Exception:
             pass
@@ -345,12 +340,65 @@ def handler(event):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return {
-            "segments": segments,
-            "clips": clips,  # ✅ usa esto para recortar fiable
-            "detected_language": result.get("language"),
-            "language_probability": result.get("language_probability"),
-        }
+
+def handler(event):
+    global _LOGGED
+    if not _LOGGED:
+        _log_gpu_once()
+        _LOGGED = True
+
+    try:
+        input_data = event.get("input", {}) or {}
+
+        audio_files = _parse_audio_files(input_data.get("audio_file"))
+        if not audio_files:
+            return {"error": "audio_file is required"}
+
+        language = input_data.get("language")  # e.g. "es"
+        batch_size = int(input_data.get("batch_size", 16))
+
+        # Para recorte fiable, por defecto alineado OFF.
+        align_output = bool(input_data.get("align_output", False))
+        diarization = bool(input_data.get("diarization", False))
+
+        min_speakers = input_data.get("min_speakers")
+        max_speakers = input_data.get("max_speakers")
+
+        device, compute_type = _get_device_and_compute(input_data)
+        print(f"[job] device={device} compute_type={compute_type} batch_size={batch_size} diarization={diarization} align={align_output}")
+
+        if len(audio_files) == 1:
+            return _process_single_audio(
+                audio_files[0],
+                input_data,
+                device,
+                compute_type,
+                language,
+                batch_size,
+                align_output,
+                diarization,
+                min_speakers,
+                max_speakers,
+            )
+
+        results = []
+        for audio_file in audio_files:
+            item_result = _process_single_audio(
+                audio_file,
+                input_data,
+                device,
+                compute_type,
+                language,
+                batch_size,
+                align_output,
+                diarization,
+                min_speakers,
+                max_speakers,
+            )
+            item_result["audio_file"] = audio_file
+            results.append(item_result)
+
+        return results
 
     except Exception as e:
         return {"error": str(e)}
