@@ -47,6 +47,49 @@ print("[INFO] ✅ Parche global torch.load(weights_only=False) aplicado.")
 
 
 # -------------------------------------------------------------------------
+# ✅ Compat HuggingFace Hub: mapear use_auth_token -> token si hace falta
+# -------------------------------------------------------------------------
+def _patch_hf_hub_download_compat():
+    try:
+        import huggingface_hub as hfh
+
+        fn = getattr(hfh, "hf_hub_download", None)
+        if fn is None:
+            return
+
+        try:
+            sig = inspect.signature(fn)
+            accepts_use_auth_token = "use_auth_token" in sig.parameters
+            accepts_token = "token" in sig.parameters
+        except Exception:
+            accepts_use_auth_token = True
+            accepts_token = True
+
+        if accepts_use_auth_token or not accepts_token:
+            return
+
+        if getattr(fn, "_vp_use_auth_token_patched", False):
+            return
+
+        def _hf_hub_download_compat(*args, **kwargs):
+            if "use_auth_token" in kwargs and "token" not in kwargs:
+                kwargs["token"] = kwargs.pop("use_auth_token")
+            else:
+                kwargs.pop("use_auth_token", None)
+            return fn(*args, **kwargs)
+
+        _hf_hub_download_compat._vp_use_auth_token_patched = True
+        hfh.hf_hub_download = _hf_hub_download_compat
+        print("[INFO] ✅ Parche hf_hub_download(use_auth_token->token) aplicado.")
+    except Exception as e:
+        print(f"[WARN] ⚠️ No se pudo aplicar compat de huggingface_hub: {e}")
+
+
+_patch_hf_hub_download_compat()
+# -------------------------------------------------------------------------
+
+
+# -------------------------------------------------------------------------
 # ✅ FIX WhisperX moderno: DiarizationPipeline se importa desde whisperx.diarize
 # -------------------------------------------------------------------------
 def _get_diarization_pipeline_class():
@@ -199,7 +242,35 @@ def _get_diarizer(hf_token: str, device: str):
     key = (hf_token, device)
     if key not in DIARIZE_CACHE:
         print(f"[diar] loading diarization pipeline device={device}")
-        DIARIZE_CACHE[key] = DiarizationPipelineCls(use_auth_token=hf_token, device=device)
+
+        # Compat entre versiones: algunas esperan use_auth_token, otras token
+        # y otras toman el token desde variables de entorno de HF.
+        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
+        os.environ.setdefault("HF_TOKEN", hf_token)
+
+        init_attempts = [
+            {"use_auth_token": hf_token, "device": device},
+            {"token": hf_token, "device": device},
+            {"device": device},
+        ]
+
+        last_error = None
+        for init_kwargs in init_attempts:
+            try:
+                DIARIZE_CACHE[key] = DiarizationPipelineCls(**init_kwargs)
+                print(f"[diar] pipeline init ok with kwargs={sorted(list(init_kwargs.keys()))}")
+                break
+            except TypeError as e:
+                last_error = e
+                print(f"[diar] init retry por TypeError con kwargs={sorted(list(init_kwargs.keys()))}: {e}")
+                continue
+            except Exception as e:
+                last_error = e
+                print(f"[diar] init failed con kwargs={sorted(list(init_kwargs.keys()))}: {e}")
+                continue
+
+        if key not in DIARIZE_CACHE:
+            raise RuntimeError(f"No se pudo inicializar DiarizationPipeline: {last_error}")
     return DIARIZE_CACHE[key]
 
 
