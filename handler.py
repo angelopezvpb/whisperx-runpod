@@ -6,6 +6,7 @@ import runpod
 import whisperx
 import torch
 import inspect
+import re
 
 # -------------------------------------------------------------------------
 # ✅ FIX PyTorch 2.6+ (weights_only=True por defecto) + OmegaConf allowlist
@@ -78,7 +79,20 @@ def _filter_kwargs_by_signature(fn, kwargs: dict) -> dict:
 
 def _call_transcribe_safely(model, audio, **kwargs):
     safe_kwargs = _filter_kwargs_by_signature(model.transcribe, kwargs)
-    return model.transcribe(audio, **safe_kwargs)
+    print(f"[transcribe] kwargs iniciales: {sorted(list(safe_kwargs.keys()))}")
+    try:
+        return model.transcribe(audio, **safe_kwargs)
+    except TypeError as e:
+        msg = str(e)
+        m = re.search(r"unexpected keyword argument '([^']+)'", msg)
+        bad_kwarg = m.group(1) if m else None
+        if bad_kwarg and bad_kwarg in safe_kwargs:
+            print(f"[transcribe] retry sin kwarg incompatible: {bad_kwarg}")
+            safe_kwargs.pop(bad_kwarg, None)
+            print(f"[transcribe] kwargs retry: {sorted(list(safe_kwargs.keys()))}")
+            return model.transcribe(audio, **safe_kwargs)
+        print(f"[transcribe] TypeError sin fallback aplicable: {msg}")
+        raise
 # -------------------------------------------------------------------------
 
 
@@ -238,19 +252,27 @@ def _process_single_audio(
     diarization: bool,
     min_speakers,
     max_speakers,
+    item_index: int = 1,
+    total_items: int = 1,
 ):
+    print(f"[audio {item_index}/{total_items}] start source={audio_file}")
     local_audio_path = audio_file
 
     try:
         if audio_file.startswith(("http://", "https://")):
+            print(f"[audio {item_index}/{total_items}] downloading remote audio")
             local_audio_path = _download_to_tmp(audio_file)
+            print(f"[audio {item_index}/{total_items}] downloaded to {local_audio_path}")
 
         try:
             audio = whisperx.load_audio(local_audio_path)
+            print(f"[audio {item_index}/{total_items}] audio loaded")
         except Exception as e:
+            print(f"[audio {item_index}/{total_items}] load_audio failed: {e}")
             return {"error": f"Failed to load audio: {str(e)}"}
 
         model = _get_whisper_model(device, compute_type, language)
+        print(f"[audio {item_index}/{total_items}] model ready")
 
         transcribe_kwargs = {
             "batch_size": batch_size,
@@ -259,9 +281,12 @@ def _process_single_audio(
         if language:
             transcribe_kwargs["language"] = language
 
+        print(f"[audio {item_index}/{total_items}] transcribe start")
         result = _call_transcribe_safely(model, audio, **transcribe_kwargs)
+        print(f"[audio {item_index}/{total_items}] transcribe done segments={len(result.get('segments', []))}")
 
         if align_output:
+            print(f"[audio {item_index}/{total_items}] align enabled")
             lang_code = result.get("language") or language
             if not lang_code:
                 print("[align] skipped (no language detected)")
@@ -286,11 +311,13 @@ def _process_single_audio(
 
                     result["language"] = det_lang
                     result["language_probability"] = det_lang_prob
+                    print(f"[audio {item_index}/{total_items}] align done")
 
                 except Exception as e:
                     print(f"[align] error: {e}")
 
         if diarization:
+            print(f"[audio {item_index}/{total_items}] diarization enabled")
             hf_token = input_data.get("huggingface_access_token")
             if not hf_token:
                 return {"error": "huggingface_access_token required for diarization"}
@@ -306,6 +333,7 @@ def _process_single_audio(
 
                 diarize_segments = diarizer(audio, **diarize_kwargs)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
+                print(f"[audio {item_index}/{total_items}] diarization done")
 
             except Exception as e:
                 print(f"[diarization] error: {e}")
@@ -321,6 +349,7 @@ def _process_single_audio(
             pad_start=float(input_data.get("clip_pad_start", 0.10)),
             pad_end=float(input_data.get("clip_pad_end", 0.20)),
         )
+        print(f"[audio {item_index}/{total_items}] clips built count={len(clips)}")
 
         return {
             "segments": segments,
@@ -333,12 +362,14 @@ def _process_single_audio(
         try:
             if local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
                 os.remove(local_audio_path)
+                print(f"[audio {item_index}/{total_items}] tmp removed")
         except Exception:
             pass
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        print(f"[audio {item_index}/{total_items}] done")
 
 
 def handler(event):
@@ -353,6 +384,7 @@ def handler(event):
         audio_files = _parse_audio_files(input_data.get("audio_file"))
         if not audio_files:
             return {"error": "audio_file is required"}
+        print(f"[job] audio_files_count={len(audio_files)}")
 
         language = input_data.get("language")  # e.g. "es"
         batch_size = int(input_data.get("batch_size", 16))
@@ -379,10 +411,12 @@ def handler(event):
                 diarization,
                 min_speakers,
                 max_speakers,
+                item_index=1,
+                total_items=1,
             )
 
         results = []
-        for audio_file in audio_files:
+        for index, audio_file in enumerate(audio_files, start=1):
             item_result = _process_single_audio(
                 audio_file,
                 input_data,
@@ -394,6 +428,8 @@ def handler(event):
                 diarization,
                 min_speakers,
                 max_speakers,
+                item_index=index,
+                total_items=len(audio_files),
             )
             item_result["audio_file"] = audio_file
             results.append(item_result)
