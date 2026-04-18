@@ -6,6 +6,7 @@ import runpod
 import whisperx
 import torch
 import inspect
+import re
 
 # -------------------------------------------------------------------------
 # ✅ FIX PyTorch 2.6+ (weights_only=True por defecto) + OmegaConf allowlist
@@ -46,6 +47,49 @@ print("[INFO] ✅ Parche global torch.load(weights_only=False) aplicado.")
 
 
 # -------------------------------------------------------------------------
+# ✅ Compat HuggingFace Hub: mapear use_auth_token -> token si hace falta
+# -------------------------------------------------------------------------
+def _patch_hf_hub_download_compat():
+    try:
+        import huggingface_hub as hfh
+
+        fn = getattr(hfh, "hf_hub_download", None)
+        if fn is None:
+            return
+
+        try:
+            sig = inspect.signature(fn)
+            accepts_use_auth_token = "use_auth_token" in sig.parameters
+            accepts_token = "token" in sig.parameters
+        except Exception:
+            accepts_use_auth_token = True
+            accepts_token = True
+
+        if accepts_use_auth_token or not accepts_token:
+            return
+
+        if getattr(fn, "_vp_use_auth_token_patched", False):
+            return
+
+        def _hf_hub_download_compat(*args, **kwargs):
+            if "use_auth_token" in kwargs and "token" not in kwargs:
+                kwargs["token"] = kwargs.pop("use_auth_token")
+            else:
+                kwargs.pop("use_auth_token", None)
+            return fn(*args, **kwargs)
+
+        _hf_hub_download_compat._vp_use_auth_token_patched = True
+        hfh.hf_hub_download = _hf_hub_download_compat
+        print("[INFO] ✅ Parche hf_hub_download(use_auth_token->token) aplicado.")
+    except Exception as e:
+        print(f"[WARN] ⚠️ No se pudo aplicar compat de huggingface_hub: {e}")
+
+
+_patch_hf_hub_download_compat()
+# -------------------------------------------------------------------------
+
+
+# -------------------------------------------------------------------------
 # ✅ FIX WhisperX moderno: DiarizationPipeline se importa desde whisperx.diarize
 # -------------------------------------------------------------------------
 def _get_diarization_pipeline_class():
@@ -78,7 +122,22 @@ def _filter_kwargs_by_signature(fn, kwargs: dict) -> dict:
 
 def _call_transcribe_safely(model, audio, **kwargs):
     safe_kwargs = _filter_kwargs_by_signature(model.transcribe, kwargs)
-    return model.transcribe(audio, **safe_kwargs)
+    print(f"[transcribe] kwargs iniciales: {sorted(list(safe_kwargs.keys()))}")
+    retry_kwargs = dict(safe_kwargs)
+    while True:
+        try:
+            return model.transcribe(audio, **retry_kwargs)
+        except TypeError as e:
+            msg = str(e)
+            m = re.search(r"unexpected keyword argument '([^']+)'", msg)
+            bad_kwarg = m.group(1) if m else None
+            if bad_kwarg and bad_kwarg in retry_kwargs:
+                print(f"[transcribe] retry sin kwarg incompatible: {bad_kwarg}")
+                retry_kwargs.pop(bad_kwarg, None)
+                print(f"[transcribe] kwargs retry: {sorted(list(retry_kwargs.keys()))}")
+                continue
+            print(f"[transcribe] TypeError sin fallback aplicable: {msg}")
+            raise
 # -------------------------------------------------------------------------
 
 
@@ -88,11 +147,48 @@ def _call_transcribe_safely(model, audio, **kwargs):
 WHISPER_MODEL = None
 WHISPER_DEVICE = None
 WHISPER_COMPUTE_TYPE = None
+WHISPER_LITERAL_MODE = None
 
 ALIGN_CACHE = {}        # key: (language_code, device) -> (align_model, metadata)
 DIARIZE_CACHE = {}      # key: (hf_token, device) -> diarize_pipeline
 
 _LOGGED = False
+
+
+def _parse_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _get_literal_mode(input_data: dict) -> bool:
+    if "literal_mode" in input_data:
+        return _parse_bool(input_data.get("literal_mode"), default=False)
+    return _parse_bool(os.getenv("WHISPER_LITERAL_MODE"), default=False)
+
+
+def _get_language(input_data: dict) -> str | None:
+    language = input_data.get("language")
+    if language is not None:
+        language = str(language).strip().lower()
+        return language or None
+
+    env_language = os.getenv("WHISPER_LANGUAGE")
+    if env_language is not None:
+        env_language = env_language.strip().lower()
+        return env_language or None
+
+    return None
 
 
 def _log_gpu_once():
@@ -129,20 +225,28 @@ def _get_device_and_compute(input_data: dict):
     return device, compute_type
 
 
-def _get_whisper_model(device: str, compute_type: str, language: str | None):
+def _get_whisper_model(device: str, compute_type: str, language: str | None, literal_mode: bool):
     """
     Carga el modelo de WhisperX de forma compatible:
     - Intenta inyectar VAD/anti-deriva mediante asr_options si load_model lo soporta.
     - Si no, no rompe.
     """
-    global WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
+    global WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE, WHISPER_LITERAL_MODE
 
-    if WHISPER_MODEL is None or WHISPER_DEVICE != device or WHISPER_COMPUTE_TYPE != compute_type:
-        print(f"[model] loading whisper large-v3 device={device} compute_type={compute_type}")
+    if (
+        WHISPER_MODEL is None
+        or WHISPER_DEVICE != device
+        or WHISPER_COMPUTE_TYPE != compute_type
+        or WHISPER_LITERAL_MODE != literal_mode
+    ):
+        print(
+            f"[model] loading whisper large-v3 device={device} "
+            f"compute_type={compute_type} literal_mode={literal_mode}"
+        )
 
         # Preferencias para timestamps más estables (si están soportadas por tu build)
         asr_options = {
-            "vad_filter": True,
+            "vad_filter": not literal_mode,
             "vad_parameters": {"min_silence_duration_ms": 300},
             "condition_on_previous_text": False,
         }
@@ -162,6 +266,7 @@ def _get_whisper_model(device: str, compute_type: str, language: str | None):
         )
         WHISPER_DEVICE = device
         WHISPER_COMPUTE_TYPE = compute_type
+        WHISPER_LITERAL_MODE = literal_mode
 
     return WHISPER_MODEL
 
@@ -185,7 +290,35 @@ def _get_diarizer(hf_token: str, device: str):
     key = (hf_token, device)
     if key not in DIARIZE_CACHE:
         print(f"[diar] loading diarization pipeline device={device}")
-        DIARIZE_CACHE[key] = DiarizationPipelineCls(use_auth_token=hf_token, device=device)
+
+        # Compat entre versiones: algunas esperan use_auth_token, otras token
+        # y otras toman el token desde variables de entorno de HF.
+        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
+        os.environ.setdefault("HF_TOKEN", hf_token)
+
+        init_attempts = [
+            {"use_auth_token": hf_token, "device": device},
+            {"token": hf_token, "device": device},
+            {"device": device},
+        ]
+
+        last_error = None
+        for init_kwargs in init_attempts:
+            try:
+                DIARIZE_CACHE[key] = DiarizationPipelineCls(**init_kwargs)
+                print(f"[diar] pipeline init ok with kwargs={sorted(list(init_kwargs.keys()))}")
+                break
+            except TypeError as e:
+                last_error = e
+                print(f"[diar] init retry por TypeError con kwargs={sorted(list(init_kwargs.keys()))}: {e}")
+                continue
+            except Exception as e:
+                last_error = e
+                print(f"[diar] init failed con kwargs={sorted(list(init_kwargs.keys()))}: {e}")
+                continue
+
+        if key not in DIARIZE_CACHE:
+            raise RuntimeError(f"No se pudo inicializar DiarizationPipeline: {last_error}")
     return DIARIZE_CACHE[key]
 
 
@@ -238,30 +371,44 @@ def _process_single_audio(
     diarization: bool,
     min_speakers,
     max_speakers,
+    literal_mode: bool,
+    item_index: int = 1,
+    total_items: int = 1,
 ):
+    print(f"[audio {item_index}/{total_items}] start source={audio_file}")
     local_audio_path = audio_file
 
     try:
         if audio_file.startswith(("http://", "https://")):
+            print(f"[audio {item_index}/{total_items}] downloading remote audio")
             local_audio_path = _download_to_tmp(audio_file)
+            print(f"[audio {item_index}/{total_items}] downloaded to {local_audio_path}")
 
         try:
             audio = whisperx.load_audio(local_audio_path)
+            print(f"[audio {item_index}/{total_items}] audio loaded")
         except Exception as e:
+            print(f"[audio {item_index}/{total_items}] load_audio failed: {e}")
             return {"error": f"Failed to load audio: {str(e)}"}
 
-        model = _get_whisper_model(device, compute_type, language)
+        model = _get_whisper_model(device, compute_type, language, literal_mode)
+        print(f"[audio {item_index}/{total_items}] model ready")
 
         transcribe_kwargs = {
             "batch_size": batch_size,
-            "condition_on_previous_text": False,
         }
+        if literal_mode:
+            # Perfil más conservador para reducir normalizaciones y deriva.
+            transcribe_kwargs["temperature"] = 0.0
         if language:
             transcribe_kwargs["language"] = language
 
+        print(f"[audio {item_index}/{total_items}] transcribe start")
         result = _call_transcribe_safely(model, audio, **transcribe_kwargs)
+        print(f"[audio {item_index}/{total_items}] transcribe done segments={len(result.get('segments', []))}")
 
         if align_output:
+            print(f"[audio {item_index}/{total_items}] align enabled")
             lang_code = result.get("language") or language
             if not lang_code:
                 print("[align] skipped (no language detected)")
@@ -286,11 +433,13 @@ def _process_single_audio(
 
                     result["language"] = det_lang
                     result["language_probability"] = det_lang_prob
+                    print(f"[audio {item_index}/{total_items}] align done")
 
                 except Exception as e:
                     print(f"[align] error: {e}")
 
         if diarization:
+            print(f"[audio {item_index}/{total_items}] diarization enabled")
             hf_token = input_data.get("huggingface_access_token")
             if not hf_token:
                 return {"error": "huggingface_access_token required for diarization"}
@@ -306,6 +455,7 @@ def _process_single_audio(
 
                 diarize_segments = diarizer(audio, **diarize_kwargs)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
+                print(f"[audio {item_index}/{total_items}] diarization done")
 
             except Exception as e:
                 print(f"[diarization] error: {e}")
@@ -321,24 +471,28 @@ def _process_single_audio(
             pad_start=float(input_data.get("clip_pad_start", 0.10)),
             pad_end=float(input_data.get("clip_pad_end", 0.20)),
         )
+        print(f"[audio {item_index}/{total_items}] clips built count={len(clips)}")
 
         return {
             "segments": segments,
             "clips": clips,
             "detected_language": result.get("language"),
             "language_probability": result.get("language_probability"),
+            "literal_mode": literal_mode,
         }
 
     finally:
         try:
             if local_audio_path.startswith("/tmp/audio_") and os.path.exists(local_audio_path):
                 os.remove(local_audio_path)
+                print(f"[audio {item_index}/{total_items}] tmp removed")
         except Exception:
             pass
 
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        print(f"[audio {item_index}/{total_items}] done")
 
 
 def handler(event):
@@ -353,9 +507,11 @@ def handler(event):
         audio_files = _parse_audio_files(input_data.get("audio_file"))
         if not audio_files:
             return {"error": "audio_file is required"}
+        print(f"[job] audio_files_count={len(audio_files)}")
 
-        language = input_data.get("language")  # e.g. "es"
+        language = _get_language(input_data)  # e.g. "es"
         batch_size = int(input_data.get("batch_size", 16))
+        literal_mode = _get_literal_mode(input_data)
 
         # Para recorte fiable, por defecto alineado OFF.
         align_output = bool(input_data.get("align_output", False))
@@ -365,7 +521,10 @@ def handler(event):
         max_speakers = input_data.get("max_speakers")
 
         device, compute_type = _get_device_and_compute(input_data)
-        print(f"[job] device={device} compute_type={compute_type} batch_size={batch_size} diarization={diarization} align={align_output}")
+        print(
+            f"[job] device={device} compute_type={compute_type} batch_size={batch_size} "
+            f"diarization={diarization} align={align_output} literal_mode={literal_mode}"
+        )
 
         if len(audio_files) == 1:
             return _process_single_audio(
@@ -379,10 +538,13 @@ def handler(event):
                 diarization,
                 min_speakers,
                 max_speakers,
+                literal_mode,
+                item_index=1,
+                total_items=1,
             )
 
         results = []
-        for audio_file in audio_files:
+        for index, audio_file in enumerate(audio_files, start=1):
             item_result = _process_single_audio(
                 audio_file,
                 input_data,
@@ -394,6 +556,9 @@ def handler(event):
                 diarization,
                 min_speakers,
                 max_speakers,
+                literal_mode,
+                item_index=index,
+                total_items=len(audio_files),
             )
             item_result["audio_file"] = audio_file
             results.append(item_result)
