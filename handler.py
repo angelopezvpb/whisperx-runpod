@@ -123,19 +123,21 @@ def _filter_kwargs_by_signature(fn, kwargs: dict) -> dict:
 def _call_transcribe_safely(model, audio, **kwargs):
     safe_kwargs = _filter_kwargs_by_signature(model.transcribe, kwargs)
     print(f"[transcribe] kwargs iniciales: {sorted(list(safe_kwargs.keys()))}")
-    try:
-        return model.transcribe(audio, **safe_kwargs)
-    except TypeError as e:
-        msg = str(e)
-        m = re.search(r"unexpected keyword argument '([^']+)'", msg)
-        bad_kwarg = m.group(1) if m else None
-        if bad_kwarg and bad_kwarg in safe_kwargs:
-            print(f"[transcribe] retry sin kwarg incompatible: {bad_kwarg}")
-            safe_kwargs.pop(bad_kwarg, None)
-            print(f"[transcribe] kwargs retry: {sorted(list(safe_kwargs.keys()))}")
-            return model.transcribe(audio, **safe_kwargs)
-        print(f"[transcribe] TypeError sin fallback aplicable: {msg}")
-        raise
+    retry_kwargs = dict(safe_kwargs)
+    while True:
+        try:
+            return model.transcribe(audio, **retry_kwargs)
+        except TypeError as e:
+            msg = str(e)
+            m = re.search(r"unexpected keyword argument '([^']+)'", msg)
+            bad_kwarg = m.group(1) if m else None
+            if bad_kwarg and bad_kwarg in retry_kwargs:
+                print(f"[transcribe] retry sin kwarg incompatible: {bad_kwarg}")
+                retry_kwargs.pop(bad_kwarg, None)
+                print(f"[transcribe] kwargs retry: {sorted(list(retry_kwargs.keys()))}")
+                continue
+            print(f"[transcribe] TypeError sin fallback aplicable: {msg}")
+            raise
 # -------------------------------------------------------------------------
 
 
@@ -394,7 +396,6 @@ def _process_single_audio(
 
         transcribe_kwargs = {
             "batch_size": batch_size,
-            "condition_on_previous_text": False,
         }
         if literal_mode:
             # Perfil más conservador para reducir normalizaciones y deriva.
